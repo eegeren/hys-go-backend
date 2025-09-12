@@ -1,7 +1,9 @@
+// handlers/enibra.go
 package handlers
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log"
@@ -14,11 +16,22 @@ import (
 	"time"
 )
 
+/*
+ENV beklenenler (NSSM -> Environment):
+  ENIBRA_BASE_URL         = http://127.0.0.1:8088  |  https://127.0.0.1:8443
+  ENIBRA_HOST_HEADER      = ik.hysavm.com.tr       (vhost/SNI için; yoksa boş bırak)
+  ENIBRA_INSECURE_TLS     = 1                      (sadece iç ortam/öz-imzalı sertifika için)
+  ENIBRA_MUSTERI_KODU     = HYS
+  ENIBRA_PAROLA           = ****
+  ENIBRA_TIMEOUT_MS       = 8000    (opsiyonel)
+  ENIBRA_CACHE_SEC        = 30      (opsiyonel)
+*/
+
 // ===================== Enibra Client =====================
 
 type enibraClient struct {
-	base       string // örn: http://91.93.154.235:8088  (DNS bypass)
-	hostHeader string // örn: ik.hysavm.com.tr          (virtual host)
+	base       string // örn: http://127.0.0.1:8088 veya https://127.0.0.1:8443
+	hostHeader string // örn: ik.hysavm.com.tr (virtual host + SNI)
 	musteri    string
 	parola     string
 	client     *http.Client
@@ -38,43 +51,51 @@ type cachedItem struct {
 }
 
 func newEnibraClientFromEnv() *enibraClient {
-	base := os.Getenv("ENIBRA_BASE_URL")    // zorunlu
-	host := os.Getenv("ENIBRA_HOST_HEADER") // opsiyonel (virtual host)
-	mus := os.Getenv("ENIBRA_MUSTERI_KODU") // zorunlu
-	par := os.Getenv("ENIBRA_PAROLA")       // zorunlu
+	base := strings.TrimRight(os.Getenv("ENIBRA_BASE_URL"), "/")
+	host := os.Getenv("ENIBRA_HOST_HEADER")
+	mus := os.Getenv("ENIBRA_MUSTERI_KODU")
+	par := os.Getenv("ENIBRA_PAROLA")
 
-	if base == "" || mus == "" || par == "" {
-		log.Println("[enibra] Uyarı: ENIBRA_* env eksik (ENIBRA_BASE_URL / ENIBRA_MUSTERI_KODU / ENIBRA_PAROLA).")
-	}
-
+	// timeout
 	tout := 8 * time.Second
 	if ms, _ := strconv.Atoi(os.Getenv("ENIBRA_TIMEOUT_MS")); ms > 0 {
 		tout = time.Duration(ms) * time.Millisecond
 	}
 
+	// cache süresi
 	ttl := 30 * time.Second
 	if sec, _ := strconv.Atoi(os.Getenv("ENIBRA_CACHE_SEC")); sec > 0 {
 		ttl = time.Duration(sec) * time.Second
 	}
 
+	// Transport (HTTPS ise TLS ayarları)
+	tr := &http.Transport{}
+	if strings.HasPrefix(strings.ToLower(base), "https://") {
+		insecure := os.Getenv("ENIBRA_INSECURE_TLS") == "1"
+		tr.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: insecure, // yalnızca iç ortamda kullanın
+			ServerName:         host,     // 127.0.0.1'e bağlansak bile SNI=host
+		}
+	}
+
 	return &enibraClient{
-		base:       strings.TrimRight(base, "/"),
+		base:       base,
 		hostHeader: host,
 		musteri:    mus,
 		parola:     par,
-		client:     &http.Client{Timeout: tout},
+		client:     &http.Client{Timeout: tout, Transport: tr},
 		cache:      &enibraCache{ttl: ttl},
 	}
 }
 
 func (c *enibraClient) personelListesi(ctx context.Context, extra url.Values) (status int, body []byte, contentType string, err error) {
-	// Cache key
+	// cache key
 	key := "PersonelListesi.doms?" + extra.Encode()
 	if b, ct, s, ok := c.cacheGet(key); ok {
 		return s, b, ct, nil
 	}
 
-	// Query birleştir
+	// query
 	q := url.Values{}
 	q.Set("MUSTERI_KODU", c.musteri)
 	q.Set("PAROLA", c.parola)
@@ -86,20 +107,20 @@ func (c *enibraClient) personelListesi(ctx context.Context, extra url.Values) (s
 
 	endpoint := c.base + "/PersonelListesi.doms?" + q.Encode()
 
-	// İstek hazırla
+	// request
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-
-	// Virtual host gerekiyorsa
 	if hh := c.hostHeader; hh != "" {
+		// virtual host + upstream header
 		req.Host = hh
 		req.Header.Set("Host", hh)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "HYS-Backend/1.0")
 
-	// Gönder
+	// send
 	resp, err := c.client.Do(req)
 	if err != nil {
+		log.Printf("[enibra] request error: %v", err)
 		return 0, nil, "", err
 	}
 	defer resp.Body.Close()
@@ -110,7 +131,6 @@ func (c *enibraClient) personelListesi(ctx context.Context, extra url.Values) (s
 		ct = "application/json; charset=utf-8"
 	}
 
-	// Cache’e koy
 	c.cacheSet(key, b, ct, resp.StatusCode)
 	return resp.StatusCode, b, ct, nil
 }
@@ -137,11 +157,12 @@ func (c *enibraClient) cacheSet(key string, body []byte, ct string, status int) 
 
 // ===================== HTTP Handler =====================
 
-// GET /api/enibra/personeller
+// GET /api/enibra/personeller[?...]
+// Mobil uygulama bu endpoint’ten direkt veri çeker.
 func EnibraPersonelListesiProxy(w http.ResponseWriter, r *http.Request) {
 	cli := newEnibraClientFromEnv()
 
-	// İstemcinin query’lerini aynen geçir
+	// istemcinin query’lerini geçir
 	extra := url.Values{}
 	for k, vals := range r.URL.Query() {
 		for _, v := range vals {
@@ -154,14 +175,12 @@ func EnibraPersonelListesiProxy(w http.ResponseWriter, r *http.Request) {
 
 	status, body, ct, err := cli.personelListesi(ctx, extra)
 	if err != nil {
-		log.Printf("[enibra] upstream error: %v", err)
 		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "enibra_upstream_error"})
 		return
 	}
 
-	// Enibra bazen 200 + HTML hata sayfası döndürebilir → 502 dönelim
+	// Upstream beklenmedik şekilde HTML hata sayfası dönerse 502 verelim
 	if strings.Contains(strings.ToLower(ct), "text/html") {
-		log.Printf("[enibra] unexpected HTML response from upstream, returning 502")
 		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "enibra_error_html"})
 		return
 	}
@@ -172,7 +191,7 @@ func EnibraPersonelListesiProxy(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// ===================== küçük yardımcı =====================
+// ===================== helpers =====================
 
 func respondJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
