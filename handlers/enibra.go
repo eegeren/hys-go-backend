@@ -1,3 +1,4 @@
+// handlers/enibra.go
 package handlers
 
 import (
@@ -38,7 +39,7 @@ func newEnibraClientFromEnv() *enibraClient {
 	par := os.Getenv("ENIBRA_PAROLA")
 
 	if base == "" || mus == "" || par == "" {
-		log.Println("[enibra] Uyarı: ENIBRA_* env eksik. Lütfen .env ayarla.")
+		log.Println("[enibra] Uyarı: ENIBRA_* env eksik. Lütfen .env/NSSM Environment ayarla.")
 	}
 	tout := 8 * time.Second
 	if ms, _ := strconv.Atoi(os.Getenv("ENIBRA_TIMEOUT_MS")); ms > 0 {
@@ -60,8 +61,7 @@ func newEnibraClientFromEnv() *enibraClient {
 }
 
 func (c *enibraClient) personelListesi(ctx context.Context, extra url.Values) (status int, body []byte, contentType string, err error) {
-	// cache key = path + query
-	key := "PersonelListesi?" + extra.Encode()
+	key := "PersonelListesi.doms?" + extra.Encode()
 	if b, ct, s, ok := c.cacheGet(key); ok {
 		return s, b, ct, nil
 	}
@@ -69,7 +69,6 @@ func (c *enibraClient) personelListesi(ctx context.Context, extra url.Values) (s
 	q := url.Values{}
 	q.Set("MUSTERI_KODU", c.musteri)
 	q.Set("PAROLA", c.parola)
-	// İstemciden gelen ekstra query’leri de geçir (örn. sayfalama vs.)
 	for k := range extra {
 		for _, v := range extra[k] {
 			q.Add(k, v)
@@ -87,11 +86,9 @@ func (c *enibraClient) personelListesi(ctx context.Context, extra url.Values) (s
 
 	ct := resp.Header.Get("Content-Type")
 	if ct == "" {
-		// çoğu .doms JSON döner; garantiye al
 		ct = "application/json; charset=utf-8"
 	}
 
-	// Başarılı/başarısız tüm yanıtları kısa süreli cache’le (thundering herd’i engeller)
 	c.cacheSet(key, b, ct, resp.StatusCode)
 	return resp.StatusCode, b, ct, nil
 }
@@ -115,14 +112,10 @@ func (c *enibraClient) cacheSet(key string, body []byte, ct string, status int) 
 	})
 }
 
-// ===================== HTTP Handler =====================
-
-// GET /api/enibra/personeller[?page=1&limit=100&...]
-// Mobil uygulama bu endpoint’ten direkt veri çeker.
+// GET /api/enibra/personeller
 func EnibraPersonelListesiProxy(w http.ResponseWriter, r *http.Request) {
 	cli := newEnibraClientFromEnv()
 
-	// istemcinin query’lerini geçir
 	extra := url.Values{}
 	for k, vals := range r.URL.Query() {
 		for _, v := range vals {
@@ -139,7 +132,14 @@ func EnibraPersonelListesiProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upstream ne döndüyse aynı status + content-type
+	// Enibra bazen 200 + HTML hata sayfası döndürebiliyor; bu durumda 502 verelim (opsiyonel güvenlik)
+	if strings.Contains(strings.ToLower(ct), "text/html") {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("enibra_error_html"))
+		return
+	}
+
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(status)
 	_, _ = w.Write(body)

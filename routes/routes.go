@@ -12,7 +12,7 @@ import (
 )
 
 func RegisterRoutes(r *mux.Router) {
-	// Middlewares
+	// middlewares
 	r.Use(corsMiddleware)
 	r.Use(defaultJSONMiddleware)
 
@@ -21,10 +21,7 @@ func RegisterRoutes(r *mux.Router) {
 	// Enibra proxy
 	api.HandleFunc("/enibra/personeller", handlers.EnibraPersonelListesiProxy).Methods(http.MethodGet)
 
-	api.HandleFunc("/device/register", handlers.RegisterDeviceToken).Methods(http.MethodPost)
-	api.HandleFunc("/device/unregister", handlers.UnregisterDeviceToken).Methods(http.MethodPost)
-
-	// Versiyon/info
+	// basit versiyon/info
 	api.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"service": "hys-go-backend",
@@ -33,8 +30,7 @@ func RegisterRoutes(r *mux.Router) {
 	}).Methods(http.MethodGet)
 }
 
-// ---------- helpers ----------
-
+// ------------ helpers ------------
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
