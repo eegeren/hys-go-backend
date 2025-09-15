@@ -16,22 +16,9 @@ import (
 	"time"
 )
 
-/*
-ENV beklenenler (NSSM -> Environment):
-  ENIBRA_BASE_URL         = http://127.0.0.1:8088  |  https://127.0.0.1:8443
-  ENIBRA_HOST_HEADER      = ik.hysavm.com.tr       (vhost/SNI için; yoksa boş bırak)
-  ENIBRA_INSECURE_TLS     = 1                      (sadece iç ortam/öz-imzalı sertifika için)
-  ENIBRA_MUSTERI_KODU     = HYS
-  ENIBRA_PAROLA           = ****
-  ENIBRA_TIMEOUT_MS       = 8000    (opsiyonel)
-  ENIBRA_CACHE_SEC        = 30      (opsiyonel)
-*/
-
-// ===================== Enibra Client =====================
-
 type enibraClient struct {
-	base       string // örn: http://127.0.0.1:8088 veya https://127.0.0.1:8443
-	hostHeader string // örn: ik.hysavm.com.tr (virtual host + SNI)
+	base       string
+	hostHeader string
 	musteri    string
 	parola     string
 	client     *http.Client
@@ -40,7 +27,7 @@ type enibraClient struct {
 
 type enibraCache struct {
 	ttl   time.Duration
-	store sync.Map // key -> cachedItem
+	store sync.Map 
 }
 
 type cachedItem struct {
@@ -73,8 +60,8 @@ func newEnibraClientFromEnv() *enibraClient {
 	if strings.HasPrefix(strings.ToLower(base), "https://") {
 		insecure := os.Getenv("ENIBRA_INSECURE_TLS") == "1"
 		tr.TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: insecure, // yalnızca iç ortamda kullanın
-			ServerName:         host,     // 127.0.0.1'e bağlansak bile SNI=host
+			InsecureSkipVerify: insecure, 
+			ServerName:         host,   
 		}
 	}
 
@@ -107,17 +94,15 @@ func (c *enibraClient) personelListesi(ctx context.Context, extra url.Values) (s
 
 	endpoint := c.base + "/PersonelListesi.doms?" + q.Encode()
 
-	// request
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if hh := c.hostHeader; hh != "" {
-		// virtual host + upstream header
 		req.Host = hh
 		req.Header.Set("Host", hh)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "HYS-Backend/1.0")
 
-	// send
+
 	resp, err := c.client.Do(req)
 	if err != nil {
 		log.Printf("[enibra] request error: %v", err)
@@ -157,12 +142,11 @@ func (c *enibraClient) cacheSet(key string, body []byte, ct string, status int) 
 
 // ===================== HTTP Handler =====================
 
-// GET /api/enibra/personeller[?...]
-// Mobil uygulama bu endpoint’ten direkt veri çeker.
+
 func EnibraPersonelListesiProxy(w http.ResponseWriter, r *http.Request) {
 	cli := newEnibraClientFromEnv()
 
-	// istemcinin query’lerini geçir
+
 	extra := url.Values{}
 	for k, vals := range r.URL.Query() {
 		for _, v := range vals {

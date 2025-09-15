@@ -14,13 +14,12 @@ import (
 	"time"
 )
 
-const enibraURL = "http://ik.hysavm.com.tr:8088/PersonelGuncellemeListesi.doms?MUSTERI_KODU=HYS&PAROLA=mxOTDjCAQvjMbdV"
+const enibraURL = "http://b2c.hysavm.com.tr:4500/api/enibra/personel"
 
-// Upstream isteğini ayrıntılı yapan yardımcı
 func fetchEnibra(verbose bool) (status int, body []byte, finalURL string, hdr http.Header, err error) {
 	transport := &http.Transport{
 		Proxy:              http.ProxyFromEnvironment,
-		DisableCompression: true, // ham body istiyoruz
+		DisableCompression: true,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 10 * time.Second,
@@ -205,9 +204,8 @@ func PersonelDetayHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sayfalama (varsayılanları artırdım)
 	page := 1
-	limit := 200 // önce 50 idi; daha fazla göster
+	limit := 200
 	maxLimit := 2000
 	if v := r.URL.Query().Get("page"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
