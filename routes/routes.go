@@ -11,12 +11,13 @@ import (
 )
 
 func RegisterRoutes(r *mux.Router) {
+	// Global middlewares
 	r.Use(corsMiddleware)
 	r.Use(defaultJSONMiddleware)
 
 	api := r.PathPrefix("/api").Subrouter()
 
-	// public endpoints
+	// --- Public ---
 	api.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "message": "HYS Go Backend Aktif"})
 	}).Methods(http.MethodGet)
@@ -25,18 +26,21 @@ func RegisterRoutes(r *mux.Router) {
 		writeJSON(w, http.StatusOK, map[string]any{"service": "hys-go-backend", "version": env("APP_VERSION", "dev")})
 	}).Methods(http.MethodGet)
 
-	// protected endpoints (X-API-Key zorunlu)
-	protected := api.NewRoute().Subrouter()
-	protected.Use(apiKeyMiddleware)
-
-	protected.HandleFunc("/enibra/personeller", handlers.EnibraPersonelListesiProxy).
-		Methods(http.MethodGet)
+	// --- Protected: /api/enibra/*
+	enibra := api.PathPrefix("/enibra").Subrouter()
+	enibra.Use(apiKeyMiddleware)
+	enibra.HandleFunc("/personeller", handlers.EnibraPersonelListesiProxy).Methods(http.MethodGet)
 }
 
-// --- middlewares ---
+// ------------ middlewares ------------
 func apiKeyMiddleware(next http.Handler) http.Handler {
 	required := env("ADMIN_TOKEN", "")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Preflight ise (OPTIONS) anahtar isteme
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if required == "" {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "server_not_configured"})
 			return
@@ -60,7 +64,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Token, X-Requested-With, X-API-Key")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-API-Key")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -79,7 +83,7 @@ func defaultJSONMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- helpers ---
+// ------------ helpers ------------
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
