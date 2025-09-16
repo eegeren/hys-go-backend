@@ -34,8 +34,8 @@ func RegisterRoutes(r *mux.Router) {
 	// Liste (proxy)
 	enibra.HandleFunc("/personeller", handlers.EnibraPersonelListesiProxy).Methods(http.MethodGet)
 
-	// İsterseniz tek kişi (TC) endpoint'ini daha sonra açarsınız:
-	// enibra.HandleFunc("/personel", handlers.EnibraPersonelByTC).Methods(http.MethodGet)
+	// Tek kişi (TC ile)
+	enibra.HandleFunc("/personel", handlers.EnibraPersonelByTC).Methods(http.MethodGet)
 }
 
 // ====================== Middlewares ======================
@@ -45,19 +45,16 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 	allowQuery := env("ALLOW_QUERY_KEY", "0") == "1"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Preflight
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
-		// Sunucu konfigür edilmemişse
 		if required == "" {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "server_not_configured"})
 			return
 		}
 
-		// Header veya (opsiyonel) query param
 		key := r.Header.Get("X-API-Key")
 		if key == "" && allowQuery {
 			key = r.URL.Query().Get("key")
