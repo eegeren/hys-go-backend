@@ -35,8 +35,9 @@ func RegisterRoutes(r *mux.Router) {
 // ------------ middlewares ------------
 func apiKeyMiddleware(next http.Handler) http.Handler {
 	required := env("ADMIN_TOKEN", "")
+	allowQuery := env("ALLOW_QUERY_KEY", "0") == "1"
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Preflight ise (OPTIONS) anahtar isteme
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -45,7 +46,17 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "server_not_configured"})
 			return
 		}
-		if r.Header.Get("X-API-Key") != required {
+
+		key := r.Header.Get("X-API-Key")
+		if key == "" && allowQuery {
+			// URL paramı ile de kabul et (geçici kolaylık)
+			key = r.URL.Query().Get("key")
+			if key == "" {
+				key = r.URL.Query().Get("x_api_key")
+			}
+		}
+
+		if key != required {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 			return
 		}
