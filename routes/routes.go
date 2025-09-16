@@ -19,17 +19,29 @@ func RegisterRoutes(r *mux.Router) {
 
 	// --- Public ---
 	api.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "message": "HYS Go Backend Aktif"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "ok",
+			"message": "HYS Go Backend Aktif",
+		})
 	}).Methods(http.MethodGet)
 
 	api.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"service": "hys-go-backend", "version": env("APP_VERSION", "dev")})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"service": "hys-go-backend",
+			"version": env("APP_VERSION", "dev"),
+		})
 	}).Methods(http.MethodGet)
 
 	// --- Protected: /api/enibra/*
 	enibra := api.PathPrefix("/enibra").Subrouter()
 	enibra.Use(apiKeyMiddleware)
+
+	// Tüm personeller (büyük JSON) — mobilde yavaş olabilir
 	enibra.HandleFunc("/personeller", handlers.EnibraPersonelListesiProxy).Methods(http.MethodGet)
+
+	// Tek personel (TC ile filtreli, hızlı)
+	// GET /api/enibra/personel?tc=12345678901
+	enibra.HandleFunc("/personel", handlers.EnibraPersonelByTC).Methods(http.MethodGet)
 }
 
 // ------------ middlewares ------------
@@ -38,6 +50,7 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 	allowQuery := env("ALLOW_QUERY_KEY", "0") == "1"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CORS preflight ise anahtar isteme
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -47,12 +60,16 @@ func apiKeyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// 1) Header
 		key := r.Header.Get("X-API-Key")
+
+		// 2) (opsiyonel) Query paramı ile de kabul et
 		if key == "" && allowQuery {
-			// URL paramı ile de kabul et (geçici kolaylık)
-			key = r.URL.Query().Get("key")
-			if key == "" {
-				key = r.URL.Query().Get("x_api_key")
+			q := r.URL.Query()
+			if v := q.Get("key"); v != "" {
+				key = v
+			} else if v := q.Get("x_api_key"); v != "" {
+				key = v
 			}
 		}
 
