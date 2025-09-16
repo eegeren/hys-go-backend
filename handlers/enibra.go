@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -181,124 +182,131 @@ func EnibraPersonelListesiProxy(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/enibra/detay
 // Upstream JSON’unu sadeleştirir + arama/sayfalama uygular
+// handlers/enibra.go içindeki EnibraPersonelDetay'ı bununla değiştir
 func EnibraPersonelDetay(w http.ResponseWriter, r *http.Request) {
+	tc := strings.TrimSpace(r.URL.Query().Get("tc"))
+	if tc == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"error": "missing_tc"})
+		return
+	}
+
 	cli := newEnibraClientFromEnv()
 	if cli.base == "" || cli.musteri == "" || cli.parola == "" {
 		respondJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "server_not_configured"})
 		return
 	}
 
+	// DİKKAT: client timeout alanı "cli.client.Timeout"
 	ctx, cancel := context.WithTimeout(r.Context(), cli.http.Timeout)
 	defer cancel()
 
+	// Tüm listeyi çek (cache'li)
 	status, body, ct, err := cli.personelListesi(ctx, url.Values{})
 	if err != nil || status < 200 || status >= 300 {
 		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "enibra_upstream_error"})
 		return
 	}
-
-	// Beklenen şema: {"SONUC_KODU":0, "SONUC_MESAJI":[ {...}, {...} ]}
-	var root struct {
-		SonucKodu   any              `json:"SONUC_KODU"`
-		SonucMesaji []map[string]any `json:"SONUC_MESAJI"`
-	}
-	if err := json.Unmarshal(body, &root); err != nil {
-		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "invalid_upstream_json"})
+	// HTML geldiyse (hata sayfası vb.)
+	if strings.Contains(strings.ToLower(ct), "text/html") {
+		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "enibra_error_html"})
 		return
 	}
 
-	type Person struct {
-		InsanID string `json:"insan_id"`
-		TC      string `json:"tc"`
-		Ad      string `json:"ad"`
-		Soyad   string `json:"soyad"`
-		Gorev   string `json:"gorev"`
-		Unvan   string `json:"unvan"`
-		Sube    string `json:"sube"`
-		Telefon string `json:"telefon"`
+	// Gelen JSON hem []map hem {items:[...]} hem de {SONUC_MESAJI:[...]} olabilir — hepsini destekle
+	var (
+		items []map[string]any
+	)
+
+	// 1) Dizi mi?
+	if err := json.Unmarshal(body, &items); err != nil || len(items) == 0 {
+		// 2) Nesne + items?
+		var obj map[string]any
+		if json.Unmarshal(body, &obj) == nil {
+			if v, ok := obj["items"].([]any); ok && len(v) > 0 {
+				tmp := make([]map[string]any, 0, len(v))
+				for _, it := range v {
+					if m, ok := it.(map[string]any); ok {
+						tmp = append(tmp, m)
+					}
+				}
+				items = tmp
+			} else if v, ok := obj["SONUC_MESAJI"].([]any); ok && len(v) > 0 {
+				// Enibra bazı uçlarda SONUC_MESAJI altında liste döndürüyor olabilir
+				tmp := make([]map[string]any, 0, len(v))
+				for _, it := range v {
+					if m, ok := it.(map[string]any); ok {
+						tmp = append(tmp, m)
+					}
+				}
+				items = tmp
+			}
+		}
 	}
 
-	getStr := func(m map[string]any, keys ...string) string {
+	if len(items) == 0 {
+		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "non_json_or_empty"})
+		return
+	}
+
+	// TC ile kaydı bul
+	row := func(list []map[string]any, want string) map[string]any {
+		want = strings.TrimSpace(want)
+		keys := []string{"TC_KIMLIK_NO", "TC", "TC_NO", "tc", "tckimlik"}
+		for _, it := range list {
+			for _, k := range keys {
+				if v, ok := it[k]; ok {
+					if strings.TrimSpace(asStr(v)) == want {
+						return it
+					}
+				}
+			}
+		}
+		return nil
+	}(items, tc)
+
+	if row == nil {
+		respondJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+		return
+	}
+
+	// Normalize alanlar
+	pickStr := func(m map[string]any, keys ...string) string {
 		for _, k := range keys {
 			if v, ok := m[k]; ok && v != nil {
-				switch t := v.(type) {
-				case string:
-					return strings.TrimSpace(t)
-				case float64:
-					if t == float64(int64(t)) {
-						return strconv.FormatInt(int64(t), 10)
-					}
-					return strconv.FormatFloat(t, 'f', -1, 64)
-				default:
-					return strings.TrimSpace(anyToString(v))
-				}
+				return strings.TrimSpace(asStr(v))
 			}
 		}
 		return ""
 	}
-
-	all := make([]Person, 0, len(root.SonucMesaji))
-	for _, m := range root.SonucMesaji {
-		all = append(all, Person{
-			InsanID: getStr(m, "INSAN_ID", "INSANID", "ID"),
-			TC:      getStr(m, "TC_KIMLIK_NO", "TC", "TCKN", "TC_NO"),
-			Ad:      getStr(m, "ADI", "AD"),
-			Soyad:   getStr(m, "SOYADI", "SOYAD"),
-			Gorev:   getStr(m, "GOREV", "GOREVI"),
-			Unvan:   getStr(m, "UNVAN"),
-			Sube:    getStr(m, "GOREV_YERI", "SUBE", "ISYERI"),
-			Telefon: getStr(m, "TELEFON", "CEP_TEL", "GSM"),
-		})
+	norm := func(s string) string {
+		s = strings.ToLower(strings.TrimSpace(s))
+		r := strings.NewReplacer("ğ", "g", "ü", "u", "ş", "s", "ı", "i", "ö", "o", "ç", "c")
+		return r.Replace(s)
 	}
 
-	// q: basit arama
-	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
-	filtered := all
-	if q != "" {
-		filtered = filtered[:0]
-		for _, p := range all {
-			hay := strings.ToLower(p.Ad + " " + p.Soyad + " " + p.Gorev + " " + p.Unvan + " " + p.Sube + " " + p.TC)
-			if strings.Contains(hay, q) {
-				filtered = append(filtered, p)
-			}
-		}
-	}
+	ad := pickStr(row, "ADI", "AD", "ad")
+	soyad := pickStr(row, "SOYADI", "SOYAD", "soyad")
+	tcOut := pickStr(row, "TC_KIMLIK_NO", "TC", "TC_NO", "tc", "tckimlik")
 
-	// page/limit
-	page := 1
-	limit := 200
-	maxLimit := 2000
-	if v := r.URL.Query().Get("page"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			page = n
-		}
-	}
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			if n > maxLimit {
-				n = maxLimit
-			}
-			limit = n
-		}
-	}
+	// Şube / görev yeri ismi
+	subeAdi := pickStr(row, "SUBE", "GOREV_YERI", "ISYERI", "ISYERI_ADI", "sube")
+	ham := norm(subeAdi + " " + pickStr(row, "ISYERI_TIPI", "BOLUM", "DEPARTMAN"))
 
-	total := len(filtered)
-	start := (page - 1) * limit
-	if start > total {
-		start = total
+	konum := "BILINMIYOR"
+	switch {
+	case strings.Contains(ham, "genel") || strings.Contains(ham, "merkez") || strings.Contains(ham, "gm"):
+		konum = "GENEL_MERKEZ"
+	case strings.Contains(ham, "magaza") || strings.Contains(ham, "mağaza") ||
+		strings.Contains(ham, "satis") || strings.Contains(ham, "satış"):
+		konum = "MAGAZA"
 	}
-	end := start + limit
-	if end > total {
-		end = total
-	}
-	pageItems := filtered[start:end]
 
 	respondJSON(w, http.StatusOK, map[string]any{
-		"page":  page,
-		"limit": limit,
-		"total": total,
-		"items": pageItems,
-		"ct":    ct, // debug amaçlı
+		"tc":         tcOut,
+		"ad":         ad,
+		"soyad":      soyad,
+		"sube_adi":   subeAdi,
+		"konum_tipi": konum, // "GENEL_MERKEZ" | "MAGAZA" | "BILINMIYOR"
 	})
 }
 
@@ -383,4 +391,24 @@ func toStringSlow(v any) string {
 	}
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// asStr: interface{} → string normalize
+func asStr(v any) string {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case json.Number:
+		return t.String()
+	case float64:
+		// float -> string (exponent olmadan)
+		if t == float64(int64(t)) {
+			return strconv.FormatInt(int64(t), 10)
+		}
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case int, int32, int64:
+		return fmt.Sprint(t)
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
 }
