@@ -31,11 +31,14 @@ func RegisterRoutes(r *mux.Router) {
 	enibra := api.PathPrefix("/enibra").Subrouter()
 	enibra.Use(apiKeyMiddleware)
 
-	// Liste (proxy)
+	// Liste (proxy)f
 	enibra.HandleFunc("/personeller", handlers.EnibraPersonelListesiProxy).Methods(http.MethodGet)
 
 	// Tek kişi (TC ile)
 	enibra.HandleFunc("/personel", handlers.EnibraPersonelByTC).Methods(http.MethodGet)
+
+	// Vardiya uyarıları (kart basmayanlar)
+	enibra.HandleFunc("/vardiya-uyarilari", handlers.EnibraVardiyaUyarilari).Methods(http.MethodGet)
 }
 
 // ====================== Middlewares ======================

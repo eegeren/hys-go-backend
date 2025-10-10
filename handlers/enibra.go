@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +31,7 @@ type enibraClient struct {
 
 type enibraCache struct {
 	ttl   time.Duration
-	store sync.Map // key -> cachedItem
+	store sync.Map
 }
 
 type cachedItem struct {
@@ -62,8 +63,8 @@ func newEnibraClientFromEnv() *enibraClient {
 	if strings.HasPrefix(strings.ToLower(base), "https://") {
 		insecure := os.Getenv("ENIBRA_INSECURE_TLS") == "1"
 		tr.TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: insecure, // self-signed vs.
-			ServerName:         host,     // SNI/Host override gerekirse
+			InsecureSkipVerify: insecure,
+			ServerName:         host,
 		}
 	}
 
@@ -310,6 +311,101 @@ func EnibraPersonelDetay(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ===================== Shift warnings =====================
+
+// GET /api/enibra/vardiya-uyarilari
+// Vardiyası belirli bir saatte başlayıp kart basmamış (GIRIS_SAATI boş) personelleri listeler.
+// Varsayılan kontrol saati now(), tolerans (grace) 20 dakikadır.
+func EnibraVardiyaUyarilari(w http.ResponseWriter, r *http.Request) {
+	checkAt := time.Now().In(time.Local)
+	if v := strings.TrimSpace(r.URL.Query().Get("check_time")); v != "" {
+		parsed, err := parseFlexibleTime(v, checkAt)
+		if err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_check_time"})
+			return
+		}
+		checkAt = parsed
+	}
+
+	grace := 20
+	if v := strings.TrimSpace(r.URL.Query().Get("grace_min")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grace_minutes"})
+			return
+		}
+		grace = n
+	}
+
+	targetStart := checkAt.Add(-time.Duration(grace) * time.Minute)
+	wantHour, wantMinute := targetStart.Hour(), targetStart.Minute()
+
+	cli := newEnibraClientFromEnv()
+	if cli.base == "" || cli.musteri == "" || cli.parola == "" {
+		respondJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "server_not_configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), cli.http.Timeout)
+	defer cancel()
+
+	status, body, ct, err := cli.personelListesi(ctx, url.Values{})
+	if err != nil || status < 200 || status >= 300 {
+		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "enibra_upstream_error"})
+		return
+	}
+	if strings.Contains(strings.ToLower(ct), "text/html") {
+		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "enibra_error_html"})
+		return
+	}
+
+	var rows []map[string]any
+	if err := json.Unmarshal(body, &rows); err != nil || len(rows) == 0 {
+		var wrapper struct {
+			SonucMesaji []map[string]any `json:"SONUC_MESAJI"`
+		}
+		if err := json.Unmarshal(body, &wrapper); err != nil {
+			respondJSON(w, http.StatusBadGateway, map[string]any{"error": "invalid_upstream_json"})
+			return
+		}
+		rows = wrapper.SonucMesaji
+	}
+	if len(rows) == 0 {
+		respondJSON(w, http.StatusBadGateway, map[string]any{"error": "empty_upstream"})
+		return
+	}
+
+	missing := make([]map[string]any, 0)
+	for _, rec := range rows {
+		startVal := strings.TrimSpace(anyToString(rec["VARDIYA_BASLANGIC"]))
+		hour, minute, ok := extractHourMinute(startVal)
+		if !ok || hour != wantHour || minute != wantMinute {
+			continue
+		}
+
+		giris := strings.TrimSpace(anyToString(rec["GIRIS_SAATI"]))
+		if giris != "" {
+			continue
+		}
+
+		missing = append(missing, map[string]any{
+			"tc":                strings.TrimSpace(anyToString(firstNonEmpty(rec, "TC_KIMLIK_NO", "TC", "TC_NO", "tc", "tckimlik"))),
+			"ad":                strings.TrimSpace(anyToString(firstNonEmpty(rec, "ADI", "AD", "ad"))),
+			"soyad":             strings.TrimSpace(anyToString(firstNonEmpty(rec, "SOYADI", "SOYAD", "soyad"))),
+			"vardiya_baslangic": startVal,
+			"giris_saati":       giris,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"check_time":          checkAt.Format(time.RFC3339),
+		"grace_minutes":       grace,
+		"target_shift_hour":   fmt.Sprintf("%02d:%02d", wantHour, wantMinute),
+		"missing_entry_count": len(missing),
+		"items":               missing,
+	})
+}
+
 // ===================== Single record by TC =====================
 
 // GET /api/enibra/personel?tc=XXXXXXXXXXX
@@ -411,4 +507,80 @@ func asStr(v any) string {
 	default:
 		return strings.TrimSpace(fmt.Sprint(v))
 	}
+}
+
+var (
+	clockRegex  = regexp.MustCompile(`(\d{1,2})[:.](\d{2})`)
+	timeLayouts = []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+		"02.01.2006 15:04:05",
+		"02.01.2006 15:04",
+		"15:04:05",
+		"15:04",
+	}
+)
+
+func extractHourMinute(s string) (int, int, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, false
+	}
+
+	loc := time.Local
+	for _, layout := range timeLayouts {
+		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
+			return t.Hour(), t.Minute(), true
+		}
+	}
+
+	if match := clockRegex.FindStringSubmatch(s); len(match) == 3 {
+		hour, err1 := strconv.Atoi(match[1])
+		min, err2 := strconv.Atoi(match[2])
+		if err1 == nil && err2 == nil && hour >= 0 && hour < 24 && min >= 0 && min < 60 {
+			return hour, min, true
+		}
+	}
+	return 0, 0, false
+}
+
+func parseFlexibleTime(val string, base time.Time) (time.Time, error) {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return base, nil
+	}
+
+	loc := base.Location()
+	for _, layout := range timeLayouts {
+		if t, err := time.ParseInLocation(layout, val, loc); err == nil {
+			if layout == "15:04" || layout == "15:04:05" {
+				return time.Date(base.Year(), base.Month(), base.Day(), t.Hour(), t.Minute(), t.Second(), 0, loc), nil
+			}
+			return t, nil
+		}
+	}
+
+	if match := clockRegex.FindStringSubmatch(val); len(match) == 3 {
+		hour, err1 := strconv.Atoi(match[1])
+		min, err2 := strconv.Atoi(match[2])
+		if err1 == nil && err2 == nil && hour >= 0 && hour < 24 && min >= 0 && min < 60 {
+			return time.Date(base.Year(), base.Month(), base.Day(), hour, min, 0, 0, loc), nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("cannot parse time")
+}
+
+func firstNonEmpty(m map[string]any, keys ...string) any {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if s := strings.TrimSpace(anyToString(v)); s != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
