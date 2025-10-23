@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const enibraURL = "http://b2c.hysavm.com.tr:4500/api/enibra/personel"
+const enibraURL = "http://ik.hysavm.com.tr:8088/PersonelListesi.doms?MUSTERI_KODU=HYS&PAROLA=mxOTDjCAQvjMbdV"
 
 func fetchEnibra(verbose bool) (status int, body []byte, finalURL string, hdr http.Header, err error) {
 	transport := &http.Transport{

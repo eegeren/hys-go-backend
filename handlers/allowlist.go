@@ -14,9 +14,9 @@ import (
 )
 
 type allowItem struct {
-	TC   string `json:"tc"`             // 11 haneli
-	Role string `json:"role"`           // "admin" veya "patron" vs.
-	Name string `json:"name,omitempty"` // opsiyonel (panelde göstermek için)
+	TC   string `json:"tc"`
+	Role string `json:"role"`
+	Name string `json:"name,omitempty"`
 }
 
 type allowStore struct {

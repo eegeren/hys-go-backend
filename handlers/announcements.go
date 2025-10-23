@@ -14,7 +14,7 @@ type Announcement struct {
 	Title     string `json:"title"`
 	Body      string `json:"body"`
 	CreatedAt string `json:"created_at"`
-	CreatedBy string `json:"created_by"` // TC veya ad-soyad
+	CreatedBy string `json:"created_by"`
 }
 
 var (
@@ -22,7 +22,6 @@ var (
 	annMu   sync.Mutex
 )
 
-// GET /api/announcements -> herkes okuyabilir
 func ListAnnouncements(w http.ResponseWriter, r *http.Request) {
 	annMu.Lock()
 	defer annMu.Unlock()

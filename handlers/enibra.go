@@ -150,7 +150,6 @@ func EnibraPersonelListesiProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query’yi aynen iletelim (page/limit/q gibi kendi parametrelerini de iletebilirsin)
 	extra := url.Values{}
 	for k, vals := range r.URL.Query() {
 		for _, v := range vals {

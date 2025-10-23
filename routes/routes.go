@@ -26,6 +26,7 @@ func RegisterRoutes(r *mux.Router) {
 			"version": env("APP_VERSION", "dev"),
 		})
 	}).Methods(http.MethodGet)
+	api.HandleFunc("/enibra/personeller/public", handlers.PersonelListesiHandler).Methods(http.MethodGet)
 
 	// --- Protected: /api/enibra/*
 	enibra := api.PathPrefix("/enibra").Subrouter()
