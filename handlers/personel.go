@@ -81,7 +81,7 @@ func fetchEnibra(verbose bool) (status int, body []byte, finalURL string, hdr ht
 }
 
 // DEBUG: upstream’dan geleni olduğu gibi döndür (header’a göre)
-func PersonelListesiHandler(w http.ResponseWriter, r *http.Request) {
+func PersonelListesiRawHandler(w http.ResponseWriter, r *http.Request) {
 	verbose := r.URL.Query().Get("debug") == "1"
 
 	status, body, finalURL, hdr, err := fetchEnibra(verbose)
