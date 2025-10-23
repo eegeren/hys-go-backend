@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -82,7 +83,17 @@ func fetchEnibra(verbose bool) (status int, body []byte, finalURL string, hdr ht
 	return resp.StatusCode, b, resp.Request.URL.String(), resp.Header, nil
 }
 
-// DEBUG: upstream’dan geleni olduğu gibi döndür (header’a göre)
+type Personel struct {
+	InsanID string `json:"insan_id"`
+	TC      string `json:"tc"`
+	Ad      string `json:"ad"`
+	Soyad   string `json:"soyad"`
+	Gorev   string `json:"gorev"`
+	Unvan   string `json:"unvan"`
+	Sube    string `json:"sube"`
+	Telefon string `json:"telefon"`
+}
+
 func PersonelListesiHandler(w http.ResponseWriter, r *http.Request) {
 	verbose := r.URL.Query().Get("debug") == "1"
 
@@ -104,13 +115,31 @@ func PersonelListesiHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upstream ne diyorsa onu verelim
-	if ct == "" {
-		ct = "application/octet-stream"
+	if r.URL.Query().Get("raw") == "1" {
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+		return
 	}
-	w.Header().Set("Content-Type", ct)
-	w.WriteHeader(http.StatusOK)
-	w.Write(body)
+
+	list, err := normalizePersonelList(trimmed)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadGateway)
+		resp := map[string]any{
+			"error":         "invalid_upstream_json",
+			"detail":        err.Error(),
+			"status":        status,
+			"upstream_code": hdr.Get("X-Upstream-Status"),
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	writePersonelListResponse(w, r, list)
 }
 
 // JSON endpoint: Upstream JSON'unu sadeleştir, sayıları string'e düzgün çevir, arama+sayfalama uygula
@@ -132,19 +161,40 @@ func PersonelDetayHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Çıkış şeması (temiz)
-	type Personel struct {
-		InsanID string `json:"insan_id"`
-		TC      string `json:"tc"`
-		Ad      string `json:"ad"`
-		Soyad   string `json:"soyad"`
-		Gorev   string `json:"gorev"`
-		Unvan   string `json:"unvan"`
-		Sube    string `json:"sube"`
-		Telefon string `json:"telefon"`
+	all := normalizePersonelFromRoot(root.SonucMesaji)
+
+	// Basit arama (q) – ad/soyad/görev/ünvan/şube/tc üzerinde
+	writePersonelListResponse(w, r, all)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func normalizePersonelList(body []byte) ([]Personel, error) {
+	var root struct {
+		SonucMesaji []map[string]any `json:"SONUC_MESAJI"`
 	}
 
-	// Yardımcı: farklı anahtar varyantlarını dene ve stringe düzgün çevir
+	if err := json.Unmarshal(body, &root); err != nil {
+		var arr []map[string]any
+		if err2 := json.Unmarshal(body, &arr); err2 != nil {
+			return nil, errors.New("upstream json beklenen formatta değil")
+		}
+		root.SonucMesaji = arr
+	}
+
+	if len(root.SonucMesaji) == 0 {
+		return nil, errors.New("upstream kayit listesi boş")
+	}
+
+	return normalizePersonelFromRoot(root.SonucMesaji), nil
+}
+
+func normalizePersonelFromRoot(items []map[string]any) []Personel {
 	getStr := func(m map[string]any, keys ...string) string {
 		for _, k := range keys {
 			if v, ok := m[k]; ok && v != nil {
@@ -152,12 +202,10 @@ func PersonelDetayHandler(w http.ResponseWriter, r *http.Request) {
 				case string:
 					return strings.TrimSpace(t)
 				case float64:
-					// Sayısal gelen (TC, INSAN_ID vb.) bilimsel gösterimsiz string
-					// Tam sayı gibi görünüyorsa ondalıksız yaz
 					if t == float64(int64(t)) {
 						return strconv.FormatInt(int64(t), 10)
 					}
-					return strconv.FormatFloat(t, 'f', -1, 64) // exponent yok
+					return strconv.FormatFloat(t, 'f', -1, 64)
 				default:
 					return strings.TrimSpace(fmt.Sprint(v))
 				}
@@ -166,10 +214,9 @@ func PersonelDetayHandler(w http.ResponseWriter, r *http.Request) {
 		return ""
 	}
 
-	// Tüm kayıtları sadeleştir
-	all := make([]Personel, 0, len(root.SonucMesaji))
-	for _, m := range root.SonucMesaji {
-		all = append(all, Personel{
+	out := make([]Personel, 0, len(items))
+	for _, m := range items {
+		out = append(out, Personel{
 			InsanID: getStr(m, "INSAN_ID", "INSANID", "ID"),
 			TC:      getStr(m, "TC_KIMLIK_NO", "TC", "TCKN", "TC_NO"),
 			Ad:      getStr(m, "ADI", "AD"),
@@ -180,8 +227,10 @@ func PersonelDetayHandler(w http.ResponseWriter, r *http.Request) {
 			Telefon: getStr(m, "TELEFON", "CEP_TEL", "GSM"),
 		})
 	}
+	return out
+}
 
-	// Basit arama (q) – ad/soyad/görev/ünvan/şube/tc üzerinde
+func writePersonelListResponse(w http.ResponseWriter, r *http.Request, all []Personel) {
 	q := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("q")))
 	filtered := all
 	if q != "" {
@@ -194,10 +243,10 @@ func PersonelDetayHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// all=1 -> tüm kayıtları dön
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
 	if r.URL.Query().Get("all") == "1" {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"items": filtered,
 			"total": len(filtered),
 		})
@@ -230,20 +279,11 @@ func PersonelDetayHandler(w http.ResponseWriter, r *http.Request) {
 	if end > total {
 		end = total
 	}
-	pageItems := filtered[start:end]
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"page":  page,
 		"limit": limit,
 		"total": total,
-		"items": pageItems,
+		"items": filtered[start:end],
 	})
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
