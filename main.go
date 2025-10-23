@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"time"
 
-	"hys-go-backend/routes"
+	"github.com/eegeren/hys-go-backend/routes"
 	"github.com/gorilla/mux"
 )
 

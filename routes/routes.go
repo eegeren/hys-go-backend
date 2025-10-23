@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"os"
 
-	"hys-go-backend/handlers"
+	"github.com/eegeren/hys-go-backend/handlers"
 
 	"github.com/gorilla/mux"
 )
