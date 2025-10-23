@@ -3,15 +3,12 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptrace"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -83,17 +80,7 @@ func fetchEnibra(verbose bool) (status int, body []byte, finalURL string, hdr ht
 	return resp.StatusCode, b, resp.Request.URL.String(), resp.Header, nil
 }
 
-type Personel struct {
-	InsanID string `json:"insan_id"`
-	TC      string `json:"tc"`
-	Ad      string `json:"ad"`
-	Soyad   string `json:"soyad"`
-	Gorev   string `json:"gorev"`
-	Unvan   string `json:"unvan"`
-	Sube    string `json:"sube"`
-	Telefon string `json:"telefon"`
-}
-
+// DEBUG: upstream’dan geleni olduğu gibi döndür (header’a göre)
 func PersonelListesiHandler(w http.ResponseWriter, r *http.Request) {
 	verbose := r.URL.Query().Get("debug") == "1"
 
@@ -115,56 +102,89 @@ func PersonelListesiHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.URL.Query().Get("raw") == "1" {
-		if ct == "" {
-			ct = "application/octet-stream"
+	// Upstream ne diyorsa onu verelim
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
+}
+
+// JSON endpoint: Upstream JSON'unu sadeleştir, sayıları string'e düzgün çevir, arama+sayfalama uygula
+// DEBUG: Upstream’dan geleni uygulamanın beklediği JSON’a dönüştür
+func PersonelListesiHandler(w http.ResponseWriter, r *http.Request) {
+	verbose := r.URL.Query().Get("debug") == "1"
+
+	status, body, finalURL, hdr, err := fetchEnibra(verbose)
+	if err != nil {
+		log.Println("❌ İstek hatası:", err)
+		http.Error(w, `{"error":"upstream_request_failed"}`, http.StatusBadGateway)
+		return
+	}
+	trimmed := bytes.TrimSpace(body)
+	if status < 200 || status >= 300 || len(trimmed) == 0 {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"error":"upstream_bad_status","status":%d,"finalURL":%q}`, status, finalURL)
+		return
+	}
+
+	// Upstream JSON'ı oku (gevşek şema)
+	var root map[string]any
+	if err := json.Unmarshal(trimmed, &root); err != nil {
+		// JSON değilse olduğu gibi pas geç (eski davranış)
+		w.Header().Set("Content-Type", hdr.Get("Content-Type"))
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/octet-stream")
 		}
-		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(http.StatusOK)
 		w.Write(body)
 		return
 	}
 
-	list, err := normalizePersonelList(trimmed)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusBadGateway)
-		resp := map[string]any{
-			"error":         "invalid_upstream_json",
-			"detail":        err.Error(),
-			"status":        status,
-			"upstream_code": hdr.Get("X-Upstream-Status"),
+	// Beklenen uyumlu çıktı: { SONUC_KODU: "0", SONUC_MESAJI: "", DATA: [...] }
+	out := map[string]any{
+		"SONUC_KODU":   "0",
+		"SONUC_MESAJI": "",
+		"DATA":         []any{},
+	}
+
+	// SONUC_KODU'nu string'e çevir
+	if v, ok := root["SONUC_KODU"]; ok && v != nil {
+		switch t := v.(type) {
+		case string:
+			out["SONUC_KODU"] = t
+		case float64:
+			out["SONUC_KODU"] = fmt.Sprintf("%d", int64(t))
+		default:
+			out["SONUC_KODU"] = fmt.Sprint(t)
 		}
-		_ = json.NewEncoder(w).Encode(resp)
-		return
 	}
 
-	writePersonelListResponse(w, r, list)
-}
-
-// JSON endpoint: Upstream JSON'unu sadeleştir, sayıları string'e düzgün çevir, arama+sayfalama uygula
-func PersonelDetayHandler(w http.ResponseWriter, r *http.Request) {
-	// fetchEnibra(verbose) -> (status int, body []byte, finalURL string, hdr http.Header, err error)
-	status, body, _, _, err := fetchEnibra(false)
-	if err != nil || status < 200 || status >= 300 || len(bytes.TrimSpace(body)) == 0 {
-		http.Error(w, `{"error":"upstream_failed"}`, http.StatusBadGateway)
-		return
+	// Upstream bazen veriyi SONUC_MESAJI altında dizi olarak gönderiyor
+	switch v := root["SONUC_MESAJI"].(type) {
+	case string:
+		out["SONUC_MESAJI"] = v
+	case []any:
+		out["DATA"] = v
+	case []map[string]any:
+		arr := make([]any, 0, len(v))
+		for _, m := range v {
+			arr = append(arr, m)
+		}
+		out["DATA"] = arr
+	default:
+		// Bazı sistemler "DATA" anahtarını zaten gönderiyor olabilir
+		if data, ok := root["DATA"]; ok {
+			out["DATA"] = data
+		}
 	}
 
-	// Upstream JSON şeması: { "SONUC_KODU":0, "SONUC_MESAJI":[ {..}, {..} ] }
-	var root struct {
-		SonucKodu   any              `json:"SONUC_KODU"`
-		SonucMesaji []map[string]any `json:"SONUC_MESAJI"`
-	}
-	if err := json.Unmarshal(body, &root); err != nil {
-		http.Error(w, `{"error":"invalid_upstream_json"}`, http.StatusBadGateway)
-		return
-	}
-
-	all := normalizePersonelFromRoot(root.SonucMesaji)
-
-	// Basit arama (q) – ad/soyad/görev/ünvan/şube/tc üzerinde
-	writePersonelListResponse(w, r, all)
+	// İçerik tipini net koy
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(out)
 }
 
 func min(a, b int) int {
@@ -172,118 +192,4 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func normalizePersonelList(body []byte) ([]Personel, error) {
-	var root struct {
-		SonucMesaji []map[string]any `json:"SONUC_MESAJI"`
-	}
-
-	if err := json.Unmarshal(body, &root); err != nil {
-		var arr []map[string]any
-		if err2 := json.Unmarshal(body, &arr); err2 != nil {
-			return nil, errors.New("upstream json beklenen formatta değil")
-		}
-		root.SonucMesaji = arr
-	}
-
-	if len(root.SonucMesaji) == 0 {
-		return nil, errors.New("upstream kayit listesi boş")
-	}
-
-	return normalizePersonelFromRoot(root.SonucMesaji), nil
-}
-
-func normalizePersonelFromRoot(items []map[string]any) []Personel {
-	getStr := func(m map[string]any, keys ...string) string {
-		for _, k := range keys {
-			if v, ok := m[k]; ok && v != nil {
-				switch t := v.(type) {
-				case string:
-					return strings.TrimSpace(t)
-				case float64:
-					if t == float64(int64(t)) {
-						return strconv.FormatInt(int64(t), 10)
-					}
-					return strconv.FormatFloat(t, 'f', -1, 64)
-				default:
-					return strings.TrimSpace(fmt.Sprint(v))
-				}
-			}
-		}
-		return ""
-	}
-
-	out := make([]Personel, 0, len(items))
-	for _, m := range items {
-		out = append(out, Personel{
-			InsanID: getStr(m, "INSAN_ID", "INSANID", "ID"),
-			TC:      getStr(m, "TC_KIMLIK_NO", "TC", "TCKN", "TC_NO"),
-			Ad:      getStr(m, "ADI", "AD"),
-			Soyad:   getStr(m, "SOYADI", "SOYAD"),
-			Gorev:   getStr(m, "GOREV", "GOREVI"),
-			Unvan:   getStr(m, "UNVAN"),
-			Sube:    getStr(m, "GOREV_YERI", "SUBE", "ISYERI"),
-			Telefon: getStr(m, "TELEFON", "CEP_TEL", "GSM"),
-		})
-	}
-	return out
-}
-
-func writePersonelListResponse(w http.ResponseWriter, r *http.Request, all []Personel) {
-	q := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("q")))
-	filtered := all
-	if q != "" {
-		filtered = filtered[:0]
-		for _, p := range all {
-			hay := strings.ToLower(p.Ad + " " + p.Soyad + " " + p.Gorev + " " + p.Unvan + " " + p.Sube + " " + p.TC)
-			if strings.Contains(hay, q) {
-				filtered = append(filtered, p)
-			}
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-
-	if r.URL.Query().Get("all") == "1" {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"items": filtered,
-			"total": len(filtered),
-		})
-		return
-	}
-
-	page := 1
-	limit := 200
-	maxLimit := 2000
-	if v := r.URL.Query().Get("page"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			page = n
-		}
-	}
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			if n > maxLimit {
-				n = maxLimit
-			}
-			limit = n
-		}
-	}
-
-	total := len(filtered)
-	start := (page - 1) * limit
-	if start > total {
-		start = total
-	}
-	end := start + limit
-	if end > total {
-		end = total
-	}
-
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"page":  page,
-		"limit": limit,
-		"total": total,
-		"items": filtered[start:end],
-	})
 }
