@@ -10,56 +10,49 @@ import (
 	"strings"
 	"time"
 
-	"github.com/eegeren/hys-go-backend/routes"
-	"github.com/gorilla/mux"
+	"hys-go-backend/routes"
 )
 
-func init() {
-	loadEnvFile(".env")
-}
-
 func main() {
-	r := mux.NewRouter()
-	routes.RegisterRoutes(r)
+	loadEnvFile(".env")
+	initTimeZone()
 
-	r.HandleFunc("/api/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok","message":"HYS Go Backend Aktif"}`))
-	})
-
-	port := os.Getenv("PORT")
+	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
 		port = "9090"
 	}
 	addr := "127.0.0.1:" + port
 
-	srv := &http.Server{
+	router := routes.NewRouter()
+
+	server := &http.Server{
 		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		Handler:      router,
+		ReadTimeout:  20 * time.Second,
+		WriteTimeout: 20 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
-		log.Printf("🚀 Sunucu çalışıyor: http://%s", addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("ListenAndServe hata: %v", err)
+		log.Printf("[INFO] server listening on http://%s", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[ERROR] listen: %v", err)
 		}
 	}()
 
-	// Graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
-	<-stop
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	<-stop
+	log.Printf("[INFO] shutdown signal received")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("Graceful shutdown hata: %v", err)
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("[ERROR] graceful shutdown failed: %v", err)
 	} else {
-		log.Println("Sunucu düzgün kapatıldı.")
+		log.Printf("[INFO] server stopped gracefully")
 	}
 }
 
@@ -76,15 +69,35 @@ func loadEnvFile(path string) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if eq := strings.Index(line, "="); eq >= 0 {
-			key := strings.TrimSpace(line[:eq])
-			val := strings.TrimSpace(line[eq+1:])
-			if n := len(val); n >= 2 && ((val[0] == '"' && val[n-1] == '"') || (val[0] == '\'' && val[n-1] == '\'')) {
-				val = val[1 : n-1]
+		if idx := strings.Index(line, "="); idx >= 0 {
+			key := strings.TrimSpace(line[:idx])
+			val := strings.TrimSpace(line[idx+1:])
+			if key == "" {
+				continue
 			}
-			if key != "" && os.Getenv(key) == "" {
+			if strings.HasPrefix(val, "\"") && strings.HasSuffix(val, "\"") && len(val) >= 2 {
+				val = strings.Trim(val, "\"")
+			}
+			if strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'") && len(val) >= 2 {
+				val = strings.Trim(val, "'")
+			}
+			if os.Getenv(key) == "" {
 				_ = os.Setenv(key, val)
 			}
 		}
 	}
+}
+
+func initTimeZone() {
+	tz := strings.TrimSpace(os.Getenv("TZ"))
+	if tz == "" {
+		return
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		log.Printf("[WARN] unable to load TZ=%s: %v", tz, err)
+		return
+	}
+	time.Local = loc
+	log.Printf("[INFO] timezone set to %s", tz)
 }

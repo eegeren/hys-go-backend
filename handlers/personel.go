@@ -1,195 +1,158 @@
 package handlers
 
 import (
-	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
-	"net"
 	"net/http"
-	"net/http/httptrace"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 )
 
-const enibraURL = "http://ik.hysavm.com.tr:8088/PersonelListesi.doms?MUSTERI_KODU=HYS&PAROLA=mxOTDjCAQvjMbdV"
-
-func fetchEnibra(verbose bool) (status int, body []byte, finalURL string, hdr http.Header, err error) {
-	transport := &http.Transport{
-		Proxy:              http.ProxyFromEnvironment,
-		DisableCompression: true,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 10 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout: 10 * time.Second,
-		IdleConnTimeout:     10 * time.Second,
-		ForceAttemptHTTP2:   false,
-	}
-
-	client := &http.Client{
-		Timeout:   20 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if verbose {
-				log.Printf("↪️  Redirect: %s\n", req.URL.String())
-			}
-			return nil
+var httpClient = &http.Client{
+	Timeout: 20 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
 		},
-	}
+	},
+}
 
-	req, err := http.NewRequest(http.MethodGet, enibraURL, nil)
+// PersonelList fetches the Enibra JSON and returns it as-is.
+func PersonelList(w http.ResponseWriter, r *http.Request) {
+	body, err := fetchPersonelData(r.Context())
 	if err != nil {
-		return 0, nil, "", nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
-	req.Header.Set("Accept", "application/json, application/xml, text/xml;q=0.9, */*;q=0.8")
-	req.Header.Set("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
-	req.Header.Set("Accept-Encoding", "identity")
-	req.Header.Set("Connection", "close")
-	req.Header.Set("Referer", "http://ik.hysavm.com.tr/")
-	req.Host = "ik.hysavm.com.tr"
-
-	if verbose {
-		trace := &httptrace.ClientTrace{
-			DNSStart: func(info httptrace.DNSStartInfo) { log.Printf("🔎 DNS start: %v", info.Host) },
-			DNSDone:  func(info httptrace.DNSDoneInfo) { log.Printf("🔎 DNS done: %v (err=%v)", info.Addrs, info.Err) },
-			ConnectStart: func(network, addr string) {
-				log.Printf("🔌 Connect start: %s %s", network, addr)
-			},
-			ConnectDone: func(network, addr string, err error) {
-				log.Printf("🔌 Connect done: %s %s (err=%v)", network, addr, err)
-			},
-			GotConn: func(info httptrace.GotConnInfo) {
-				log.Printf("✅ GotConn: reused=%v, wasIdle=%v", info.Reused, info.WasIdle)
-			},
-		}
-		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+		status, payload := classifyFetchError(err)
+		WriteJSON(w, status, payload)
+		return
 	}
 
-	resp, err := client.Do(req)
+	var parsed any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		WriteJSON(w, http.StatusBadGateway, map[string]any{
+			"error":   "invalid_enibra_json",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	WriteJSONValue(w, http.StatusOK, parsed)
+}
+
+func fetchPersonelData(ctx context.Context) ([]byte, error) {
+	base := strings.TrimSpace(os.Getenv("ENIBRA_URL"))
+	if base == "" {
+		return nil, fmt.Errorf("%w: ENIBRA_URL missing", errConfig)
+	}
+
+	key, err := resolveEnibraKey()
 	if err != nil {
-		return 0, nil, "", nil, err
+		return nil, fmt.Errorf("%w: %v", errConfig, err)
+	}
+
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errConfig, err)
+	}
+
+	q := parsed.Query()
+	if q.Get("key") == "" {
+		q.Set("key", key)
+	}
+	parsed.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "hys-go-backend/1.0")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	b, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return resp.StatusCode, nil, resp.Request.URL.String(), resp.Header, readErr
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(&io.LimitedReader{R: resp.Body, N: 4096})
+		return nil, fmt.Errorf("%w: status=%d body=%s", errUpstreamStatus, resp.StatusCode, string(snippet))
 	}
-	return resp.StatusCode, b, resp.Request.URL.String(), resp.Header, nil
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsedJSON any
+	if err := json.Unmarshal(body, &parsedJSON); err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidJSON, err)
+	}
+
+	return body, nil
 }
 
-// DEBUG: upstream’dan geleni olduğu gibi döndür (header’a göre)
-func PersonelListesiRawHandler(w http.ResponseWriter, r *http.Request) {
-	verbose := r.URL.Query().Get("debug") == "1"
+var (
+	errConfig         = errors.New("configuration_error")
+	errUpstreamStatus = errors.New("upstream_status_error")
+	errInvalidJSON    = errors.New("invalid_json")
+	errMissingKey     = errors.New("missing_enibra_key")
+	errDecodeKey      = errors.New("decode_enibra_key_failed")
+)
 
-	status, body, finalURL, hdr, err := fetchEnibra(verbose)
-	if err != nil {
-		log.Println("❌ İstek hatası:", err)
-		http.Error(w, "Veri alınamadı (istek hatası)", http.StatusBadGateway)
-		return
-	}
-
-	ct := hdr.Get("Content-Type")
-	trimmed := bytes.TrimSpace(body)
-
-	if status < 200 || status >= 300 || len(trimmed) == 0 {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprintf(w, "Uzak servisten beklenen veri alınamadı.\nstatus=%d %s\nfinalURL=%s\nheaders=%v\n\nBODY (ilk 500):\n%s",
-			status, http.StatusText(status), finalURL, hdr, string(trimmed[:min(500, len(trimmed))]))
-		return
-	}
-
-	// Upstream ne diyorsa onu verelim
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
-	w.Header().Set("Content-Type", ct)
-	w.WriteHeader(http.StatusOK)
-	w.Write(body)
-}
-
-// JSON endpoint: Upstream JSON'unu sadeleştir, sayıları string'e düzgün çevir, arama+sayfalama uygula
-// DEBUG: Upstream’dan geleni uygulamanın beklediği JSON’a dönüştür
-func PersonelListesiHandler(w http.ResponseWriter, r *http.Request) {
-	verbose := r.URL.Query().Get("debug") == "1"
-
-	status, body, finalURL, hdr, err := fetchEnibra(verbose)
-	if err != nil {
-		log.Println("❌ İstek hatası:", err)
-		http.Error(w, `{"error":"upstream_request_failed"}`, http.StatusBadGateway)
-		return
-	}
-	trimmed := bytes.TrimSpace(body)
-	if status < 200 || status >= 300 || len(trimmed) == 0 {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprintf(w, `{"error":"upstream_bad_status","status":%d,"finalURL":%q}`, status, finalURL)
-		return
-	}
-
-	// Upstream JSON'ı oku (gevşek şema)
-	var root map[string]any
-	if err := json.Unmarshal(trimmed, &root); err != nil {
-		// JSON değilse olduğu gibi pas geç (eski davranış)
-		w.Header().Set("Content-Type", hdr.Get("Content-Type"))
-		if w.Header().Get("Content-Type") == "" {
-			w.Header().Set("Content-Type", "application/octet-stream")
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(body)
-		return
-	}
-
-	// Beklenen uyumlu çıktı: { SONUC_KODU: "0", SONUC_MESAJI: "", DATA: [...] }
-	out := map[string]any{
-		"SONUC_KODU":   "0",
-		"SONUC_MESAJI": "",
-		"DATA":         []any{},
-	}
-
-	// SONUC_KODU'nu string'e çevir
-	if v, ok := root["SONUC_KODU"]; ok && v != nil {
-		switch t := v.(type) {
-		case string:
-			out["SONUC_KODU"] = t
-		case float64:
-			out["SONUC_KODU"] = fmt.Sprintf("%d", int64(t))
-		default:
-			out["SONUC_KODU"] = fmt.Sprint(t)
-		}
-	}
-
-	// Upstream bazen veriyi SONUC_MESAJI altında dizi olarak gönderiyor
-	switch v := root["SONUC_MESAJI"].(type) {
-	case string:
-		out["SONUC_MESAJI"] = v
-	case []any:
-		out["DATA"] = v
-	case []map[string]any:
-		arr := make([]any, 0, len(v))
-		for _, m := range v {
-			arr = append(arr, m)
-		}
-		out["DATA"] = arr
+func classifyFetchError(err error) (int, map[string]any) {
+	switch {
+	case errors.Is(err, errConfig):
+		return http.StatusServiceUnavailable, map[string]any{"error": "configuration_error", "message": err.Error()}
+	case errors.Is(err, errInvalidJSON):
+		return http.StatusBadGateway, map[string]any{"error": "invalid_enibra_json", "message": err.Error()}
+	case errors.Is(err, errUpstreamStatus):
+		return http.StatusBadGateway, map[string]any{"error": "enibra_status_error", "message": err.Error()}
 	default:
-		// Bazı sistemler "DATA" anahtarını zaten gönderiyor olabilir
-		if data, ok := root["DATA"]; ok {
-			out["DATA"] = data
-		}
+		return http.StatusBadGateway, map[string]any{"error": "enibra_request_failed", "message": err.Error()}
 	}
-
-	// İçerik tipini net koy
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(out)
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// WriteJSON writes map or struct as JSON with indentation.
+func WriteJSON(w http.ResponseWriter, status int, payload any) {
+	WriteJSONValue(w, status, payload)
+}
+
+// WriteJSONValue writes any JSON payload using indentation and utf-8.
+func WriteJSONValue(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	w.WriteHeader(status)
+	_ = enc.Encode(payload)
+}
+
+func resolveEnibraKey() (string, error) {
+	if key := strings.TrimSpace(os.Getenv("ENIBRA_KEY")); key != "" {
+		return key, nil
 	}
-	return b
+
+	encoded := strings.TrimSpace(os.Getenv("ENIBRA_KEY_ENC"))
+	if encoded == "" {
+		return "", errMissingKey
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", errDecodeKey, err)
+	}
+	return string(decoded), nil
 }

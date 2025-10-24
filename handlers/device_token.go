@@ -48,7 +48,7 @@ func writeTokens(list []DeviceToken) error {
 
 // POST /api/device/register
 // Body: { "tc":"...", "platform":"android|ios", "token":"FCM_TOKEN" }
-func RegisterDeviceToken(w http.ResponseWriter, r *http.Request) {
+func RegisterDeviceTokenHandler(w http.ResponseWriter, r *http.Request) {
 	var in DeviceToken
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		http.Error(w, "bad_request", http.StatusBadRequest)
@@ -91,7 +91,7 @@ func RegisterDeviceToken(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/device/unregister
 // Body: { "tc":"...", "token":"FCM_TOKEN" }
-func UnregisterDeviceToken(w http.ResponseWriter, r *http.Request) {
+func UnregisterDeviceTokenHandler(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		TCKimlikNo string `json:"tc"`
 		Token      string `json:"token"`
